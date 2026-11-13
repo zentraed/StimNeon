@@ -1042,3 +1042,11 @@ def test_constructor_from_dict_errors():
     
     with pytest.raises(ValueError, match="Qubit index must be non-negative"):
         stim.PauliString({"I": [-1]})
+
+@pytest.mark.parametrize("n", [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000])
+def test_to_numpy_bool_matches_bit_packed(n: int):
+    p = stim.PauliString.random(n)
+    for u, b in zip(p.to_numpy(), p.to_numpy(bit_packed=True)):
+        assert u.dtype == np.bool_
+        assert u.view(np.uint8).max(initial=0) <= 1
+        np.testing.assert_array_equal(u, np.unpackbits(b, bitorder='little')[:n])

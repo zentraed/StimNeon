@@ -190,3 +190,26 @@ def test_circuit_sampler_actually_fills_array():
     sampler = circuit.compile_detector_sampler()
     measure_data = sampler.sample(shots=10000)
     assert np.all(measure_data)
+
+
+_BOOL_OUTPUT_SIZES = [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257, 300]
+
+
+def _assert_bool_matches_packed(unpacked: np.ndarray, packed: np.ndarray, num_bits: int):
+    assert unpacked.dtype == np.bool_
+    assert unpacked.shape == (packed.shape[0], num_bits)
+    # numpy assumes bools are exactly 0 or 1.
+    assert unpacked.view(np.uint8).max(initial=0) <= 1
+    np.testing.assert_array_equal(unpacked, np.unpackbits(packed, axis=1, bitorder='little')[:, :num_bits])
+
+
+@pytest.mark.parametrize("num_bits", _BOOL_OUTPUT_SIZES)
+def test_bool_output_matches_bit_packed_output(num_bits: int):
+    circuit = stim.Circuit()
+    if num_bits:
+        circuit.append("X_ERROR", range(num_bits), 0.5)
+        circuit.append("M", range(num_bits))
+    for shots in _BOOL_OUTPUT_SIZES:
+        packed = circuit.compile_sampler(seed=shots).sample(shots, bit_packed=True)
+        unpacked = circuit.compile_sampler(seed=shots).sample(shots)
+        _assert_bool_matches_packed(unpacked, packed, num_bits)

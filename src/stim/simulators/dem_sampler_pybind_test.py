@@ -80,3 +80,23 @@ def test_dem_sampler_actually_fills_obs_array():
     sampler = dem.compile_sampler()
     _, obs_data, _ = sampler.sample(shots=10000)
     assert np.all(obs_data)
+
+
+_BOOL_OUTPUT_SIZES = [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257, 300]
+
+
+@pytest.mark.parametrize("num_errors", _BOOL_OUTPUT_SIZES)
+def test_bool_output_matches_bit_packed_output(num_errors: int):
+    dem = stim.DetectorErrorModel()
+    for k in range(num_errors):
+        dem.append("error", 0.5, [stim.target_relative_detector_id(k)] + ([stim.target_logical_observable_id(k % 3)] if k % 2 else []))
+    num_dets = dem.num_detectors
+    num_obs = dem.num_observables
+    for shots in _BOOL_OUTPUT_SIZES:
+        dets, obs, errs = dem.compile_sampler(seed=shots).sample(shots, return_errors=True)
+        pdets, pobs, perrs = dem.compile_sampler(seed=shots).sample(shots, return_errors=True, bit_packed=True)
+        for unpacked, packed, n in [(dets, pdets, num_dets), (obs, pobs, num_obs), (errs, perrs, num_errors)]:
+            assert unpacked.dtype == np.bool_
+            assert unpacked.shape == (shots, n)
+            assert unpacked.view(np.uint8).max(initial=0) <= 1
+            np.testing.assert_array_equal(unpacked, np.unpackbits(packed, axis=1, bitorder='little')[:, :n])

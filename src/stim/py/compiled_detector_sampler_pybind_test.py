@@ -457,3 +457,70 @@ def test_consistent_data_across_measurement_sampling_options():
     b = sampler.sample(shots=311, bit_packed=False)
 
     np.testing.assert_array_equal(a, np.packbits(b, bitorder='little', axis=1))
+
+
+_BOOL_OUTPUT_SIZES = [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257, 300]
+
+
+def _assert_bool_matches_packed(unpacked: np.ndarray, packed: np.ndarray, num_bits: int):
+    assert unpacked.dtype == np.bool_
+    assert unpacked.shape == (packed.shape[0], num_bits)
+    # numpy assumes bools are exactly 0 or 1.
+    assert unpacked.view(np.uint8).max(initial=0) <= 1
+    np.testing.assert_array_equal(unpacked, np.unpackbits(packed, axis=1, bitorder='little')[:, :num_bits])
+
+
+def _random_detector_circuit(num_dets: int, num_obs: int) -> stim.Circuit:
+    n = max(num_dets, num_obs, 1)
+    circuit = stim.Circuit()
+    circuit.append("X_ERROR", range(n), 0.5)
+    circuit.append("M", range(n))
+    for k in range(num_dets):
+        circuit.append("DETECTOR", [stim.target_rec(k - n)])
+    for k in range(num_obs):
+        circuit.append("OBSERVABLE_INCLUDE", [stim.target_rec(-1 - k)], k)
+    return circuit
+
+
+@pytest.mark.parametrize("num_dets", _BOOL_OUTPUT_SIZES)
+def test_bool_output_matches_bit_packed_output(num_dets: int):
+    circuit = _random_detector_circuit(num_dets, 3)
+    for shots in _BOOL_OUTPUT_SIZES:
+        def sample(**kwargs):
+            return circuit.compile_detector_sampler(seed=shots).sample(shots, **kwargs)
+
+        _assert_bool_matches_packed(sample(), sample(bit_packed=True), num_dets)
+        _assert_bool_matches_packed(
+            sample(append_observables=True), sample(append_observables=True, bit_packed=True), num_dets + 3)
+        _assert_bool_matches_packed(
+            sample(prepend_observables=True), sample(prepend_observables=True, bit_packed=True), num_dets + 3)
+        dets, obs = sample(separate_observables=True)
+        packed_dets, packed_obs = sample(separate_observables=True, bit_packed=True)
+        _assert_bool_matches_packed(dets, packed_dets, num_dets)
+        _assert_bool_matches_packed(obs, packed_obs, 3)
+
+        # transposed=True goes through the non-transposed converter.
+        t = sample(transposed=True)
+        t_packed = sample(transposed=True, bit_packed=True)
+        assert t.shape == (num_dets, shots)
+        _assert_bool_matches_packed(t, t_packed, shots)
+
+
+@pytest.mark.parametrize("num_dets,shots", [(1, 1), (9, 7), (65, 129), (129, 65), (257, 300)])
+def test_bool_output_into_non_contiguous_buffers(num_dets: int, shots: int):
+    circuit = _random_detector_circuit(num_dets, 2)
+    expected_dets, expected_obs = circuit.compile_detector_sampler(seed=3).sample(shots, separate_observables=True)
+
+    buffers = [
+        np.zeros((shots, num_dets), dtype=np.bool_, order='F'),  # strides(1) != 1
+        np.zeros((shots, 2 * num_dets), dtype=np.bool_)[:, ::2],  # step-sliced columns
+        np.zeros((2 * shots, num_dets), dtype=np.bool_)[::2],  # step-sliced rows
+        np.zeros((shots, num_dets), dtype=np.bool_)[::-1, ::-1],  # negative strides
+    ]
+    for dets_out in buffers:
+        dets_out[...] = True
+        obs_out = np.ones((shots, 4), dtype=np.bool_)[:, 1:3]
+        circuit.compile_detector_sampler(seed=3).sample(
+            shots, separate_observables=True, dets_out=dets_out, obs_out=obs_out)
+        np.testing.assert_array_equal(dets_out, expected_dets)
+        np.testing.assert_array_equal(obs_out, expected_obs)

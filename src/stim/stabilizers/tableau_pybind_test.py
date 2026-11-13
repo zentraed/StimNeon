@@ -1017,3 +1017,12 @@ def test_from_stabilizers_error_messages():
             stim.PauliString("_Z_"),
             stim.PauliString("Z_Z"),
         ])
+
+
+@pytest.mark.parametrize("n", [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257])
+def test_to_numpy_bool_matches_bit_packed(n: int):
+    t = stim.Tableau.random(n)
+    for u, p in zip(t.to_numpy(), t.to_numpy(bit_packed=True)):
+        assert u.dtype == np.bool_
+        assert u.view(np.uint8).max(initial=0) <= 1
+        np.testing.assert_array_equal(u, np.unpackbits(p, axis=-1, bitorder='little')[..., :n])

@@ -28,6 +28,9 @@ compiler and flags:
   **2.2–2.3×** faster. Most of this comes from a faster random-number sampler for macOS (see
   [Optimization notes](#optimization-notes)), which doesn't depend on NEON.
 - **Moderate speedups for single-shot sampling:** **1.31–1.40×** faster.
+- **Faster Python sampling with the default bool output:** `sample()` without `bit_packed`
+  is **3.0–8.3×** faster and now within 1.4× of bit-packed output (see
+  [Python sampling with bool output](#python-sampling-with-bool-output)).
 - **No change for most of Stim:** 48 of 72 benchmarks are within measurement noise. The
   geometric-mean speedup across all 72 is **1.28×**.
 - **No clear regressions.** One benchmark measured slower, and its fastest round matched the
@@ -49,7 +52,8 @@ All 1,442 C++ tests pass, including under AddressSanitizer and UndefinedBehavior
 | [`src/stim/util_top/reference_sample_tree.cc`](src/stim/util_top/reference_sample_tree.cc), [`.h`](src/stim/util_top/reference_sample_tree.h) | Reference samples of circuits with 64 or fewer qubits use 64-bit words. |
 | [`src/stim/util_bot/probability_util.cc`](src/stim/util_bot/probability_util.cc), [`.h`](src/stim/util_bot/probability_util.h) | `RareErrorIterator` samples the gap to the next error as `floor(log(u) / log(1 - p))` instead of calling `std::geometric_distribution`. Applies to every platform; the speedup is on macOS. |
 | [`src/stim/simulators/frame_simulator.inl`](src/stim/simulators/frame_simulator.inl) | `reset_all()` fills only the real qubits' rows of the Z frame with random bits, and zeroes the padding rows. |
-| [`src/stim/py/numpy.pybind.cc`](src/stim/py/numpy.pybind.cc) | Bit-packed results are converted to numpy in W×W blocks with the word type's own SIMD transpose (128×128 on NEON). |
+| [`src/stim/py/numpy.pybind.cc`](src/stim/py/numpy.pybind.cc) | Bit-packed and bool results are converted to numpy in W×W blocks with the word type's own SIMD transpose (128×128 on NEON). Bool output expands bits to bytes with NEON (or a lookup table on other backends) and is written one shot row at a time (see [Python sampling with bool output](#python-sampling-with-bool-output)). |
+| Python tests in [`src/stim/py/`](src/stim/py), [`src/stim/simulators/`](src/stim/simulators), [`src/stim/stabilizers/`](src/stim/stabilizers) | Bool output checked against unpacked bit-packed output at sizes 0–300, including caller-supplied non-contiguous output buffers. |
 | [`src/stim/mem/bitword_128_sse.h`](src/stim/mem/bitword_128_sse.h) | Small cleanups to the SSE backend (`alignas(16)`, direct `u64` access in `operator bool` and `to_u64_array`). x86 only. |
 | [`CMakeLists.txt`](CMakeLists.txt) | Builds out of the box on macOS with the default Apple clang (see [Building](#building-on-macos)). |
 | [`src/stim/mem/simd_bits.perf.cc`](src/stim/mem/simd_bits.perf.cc), [`simd_word.perf.cc`](src/stim/mem/simd_word.perf.cc) | Extra RNG benchmarks; `simd_compat_popcnt` now times `simd_bits::popcnt()`. |
@@ -197,9 +201,45 @@ Clang already compiles upstream's 64-bit loops to NEON instructions automaticall
 simple loops over bit arrays the original is effectively a NEON implementation, and there is
 little left to gain.
 
+### Python sampling with bool output
+
+`sampler.sample(n)` returns `np.bool_` arrays by default. Before this change, StimNeon's
+`bit_packed=True` sampling was about 4× faster than the PyPI Stim 1.16.0 wheel, but the default
+bool output was no faster: converting the result to numpy wrote one bit per element, walking
+down one output column at a time. The bool conversion now uses the same SIMD block transpose
+as the bit-packed path (details in [Optimization notes](#optimization-notes)).
+
+Rotated surface-code memory circuit, `rounds = distance`, noise 10⁻³, single thread,
+thousands of shots per second (median of 15 runs; StimNeon columns are the median of three
+benchmark runs):
+
+| Circuit, shots per call | Output | PyPI 1.16.0 | StimNeon before | StimNeon now | Speedup | StimNeon `bit_packed=True` |
+|---|---|---:|---:|---:|---:|---:|
+| d=5, 100K | measurements | 1,049 | 1,761 | 14,604 | **8.3×** | 15,307 |
+| d=5, 100K | detectors | 2,618 | 3,398 | 19,651 | **5.8×** | 20,111 |
+| d=11, 100K | measurements | 153 | 227 | 1,237 | **5.4×** | 1,586 |
+| d=11, 100K | detectors | 229 | 225 | 1,368 | **6.1×** | 1,831 |
+
+At 16K shots per call the speedups are 3.0–4.0×. Bool output now takes 1.02–1.41× the time of
+bit-packed output, and is faster than calling `np.unpackbits` on the bit-packed result. Seeded
+outputs are byte-identical to before the change. Packed-path code is unchanged, but its timings
+varied by about 2× between runs on this machine during these measurements, so a small
+packed-path regression can't be ruled out. The full write-up, benchmark script and
+interleaved timings are in [`PROPOSAL_bool_output.md`](PROPOSAL_bool_output.md).
+
 ## Optimization notes
 
 Each of these was found by measuring, and checked against the original after the change.
+
+- **Bool numpy output: 3–8× faster.** The bool converter walked every shot for each
+  measurement or detector, writing one byte `num_bits` bytes after the previous one. Each output
+  cache line was therefore written in 64 separate passes, and at 100K shots the output (144 MB
+  at d=11) is far larger than any cache. The converter now transposes 128×128 blocks like the
+  bit-packed path, then expands each transposed row's 16 bytes into 128 bools with `TBL` +
+  `CMTST` + `AND` (a 256-entry lookup table on other backends, which is about 2× slower in
+  cache). It loops over shot blocks on the outside, so each block of output rows is written in
+  one sequential sweep. With the loops the other way round, partial cache lines at block edges
+  were fetched again on every pass, and at d=11 it was slower than `np.unpackbits`.
 
 - **Geometric sampling by inversion: 3.3–4.7× faster rare-error sampling on macOS.** Profiling
   noisy surface-code sampling showed 55–60% of the time in `std::poisson_distribution`,

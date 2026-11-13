@@ -14,8 +14,78 @@
 
 #include "stim/py/numpy.pybind.h"
 
+#include <array>
+#include <cstring>
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 using namespace stim;
 using namespace stim_pybind;
+
+namespace {
+
+// Maps a byte to 8 bytes of 0/1, in little-endian bit order (bit k of the byte becomes byte k).
+struct ByteToBoolsTable {
+    std::array<uint64_t, 256> entries;
+    constexpr ByteToBoolsTable() : entries() {
+        for (size_t b = 0; b < 256; b++) {
+            uint64_t v = 0;
+            for (size_t k = 0; k < 8; k++) {
+                if ((b >> k) & 1) {
+                    v |= uint64_t{1} << (8 * k);
+                }
+            }
+            entries[b] = v;
+        }
+    }
+};
+constexpr ByteToBoolsTable BYTE_TO_BOOLS{};
+
+/// Writes `num_bits` bools (each exactly 0 or 1) to the contiguous buffer `out`, from the little-endian bit
+/// packed buffer `in`. Writes exactly `num_bits` bytes; reads ceil(num_bits / 8) bytes.
+inline void expand_bits_to_bools(const uint8_t *in, size_t num_bits, uint8_t *out) {
+    size_t num_full_bytes = num_bits >> 3;
+    size_t k = 0;
+#ifdef __ARM_NEON
+    // 16 input bytes -> 128 output bytes: replicate each byte across 8 lanes, test one bit per lane.
+    static const uint8_t lane_bits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bit_mask = vld1q_u8(lane_bits);
+    const uint8x16_t one = vdupq_n_u8(1);
+    uint8x16_t idx = vcombine_u8(vdup_n_u8(0), vdup_n_u8(1));
+    const uint8x16_t two = vdupq_n_u8(2);
+    for (; k + 16 <= num_full_bytes; k += 16) {
+        uint8x16_t v = vld1q_u8(in + k);
+        uint8x16_t i = idx;
+        for (size_t j = 0; j < 8; j++) {
+            vst1q_u8(out + 8 * k + 16 * j, vandq_u8(vtstq_u8(vqtbl1q_u8(v, i), bit_mask), one));
+            i = vaddq_u8(i, two);
+        }
+    }
+#endif
+    for (; k < num_full_bytes; k++) {
+        memcpy(out + 8 * k, &BYTE_TO_BOOLS.entries[in[k]], 8);
+    }
+    size_t tail = num_bits & 7;
+    if (tail) {
+        uint8_t b = in[num_full_bytes];
+        uint8_t *o = out + 8 * num_full_bytes;
+        for (size_t t = 0; t < tail; t++) {
+            o[t] = (b >> t) & 1;
+        }
+    }
+}
+
+/// Same as expand_bits_to_bools, but output element t goes to out + t * stride.
+inline void expand_bits_to_bools_strided(const uint8_t *in, size_t num_bits, uint8_t *out, ptrdiff_t stride) {
+    for (size_t t = 0; t < num_bits; t++) {
+        *out = (in[t >> 3] >> (t & 7)) & 1;
+        out += stride;
+    }
+}
+
+}  // namespace
 
 static pybind11::object transposed_simd_bit_table_to_numpy_uint8(
     const simd_bit_table<MAX_BITWORD_WIDTH> &table,
@@ -118,13 +188,43 @@ static pybind11::object transposed_simd_bit_table_to_numpy_bool8(
     }
 
     if (num_major_in && num_minor_in) {
-        auto stride = buf.strides(0);
-        for (size_t major = 0; major < num_major_in; major++) {
-            auto row = table[major];
-            auto ptr = buf.mutable_data(0, major);
-            for (size_t minor = 0; minor < num_minor_in; minor++) {
-                *ptr = row[minor];
-                ptr += stride;
+        // Same W x W block transpose as transposed_simd_bit_table_to_numpy_uint8, but each transposed row is
+        // expanded into bools. Writing one shot's bits at a time keeps the writes row-contiguous instead of
+        // walking down one output column per table row.
+        //
+        // The loop order is the reverse of the uint8 version: for each block of W shots, sweep across all
+        // majors. That fills each block of W output rows completely before moving on, so the (8x larger)
+        // bool output is written in one sequential pass instead of being revisited once per major block.
+        // The reads this scatters (W/8 bytes from each table row) stay in cache across neighboring blocks.
+        constexpr size_t W = MAX_BITWORD_WIDTH;
+        std::vector<bitword<W>> transpose_buffer(W);
+
+        uint8_t *base = reinterpret_cast<uint8_t *>(buf.mutable_data(0, 0));
+        ptrdiff_t stride0 = buf.strides(0);
+        ptrdiff_t stride1 = buf.strides(1);
+        for (size_t b1 = 0; b1 < num_minor_in; b1 += W) {
+            size_t n1 = std::min(W, num_minor_in - b1);
+            for (size_t b0 = 0; b0 < num_major_in; b0 += W) {
+                size_t n0 = std::min(W, num_major_in - b0);
+
+                for (size_t d0 = 0; d0 < n0; d0++) {
+                    transpose_buffer[d0] = table[b0 + d0].ptr_simd[b1 / W];
+                }
+                for (size_t d0 = n0; d0 < W; d0++) {
+                    transpose_buffer[d0] = bitword<W>::tile8(0);
+                }
+                bitword<W>::inplace_transpose_square(transpose_buffer.data(), 1);
+
+                uint8_t *row_out = base + stride0 * (ptrdiff_t)b1 + stride1 * (ptrdiff_t)b0;
+                for (size_t d1 = 0; d1 < n1; d1++) {
+                    const uint8_t *row_in = transpose_buffer[d1].u8;
+                    if (stride1 == 1) {
+                        expand_bits_to_bools(row_in, n0, row_out);
+                    } else {
+                        expand_bits_to_bools_strided(row_in, n0, row_out, stride1);
+                    }
+                    row_out += stride0;
+                }
             }
         }
     }
@@ -204,13 +304,14 @@ static pybind11::object simd_bit_table_to_numpy_bool8(
     }
 
     if (num_major && num_minor) {
-        auto stride = buf.strides(1);
+        ptrdiff_t stride = buf.strides(1);
         for (size_t major = 0; major < num_major; major++) {
-            auto row = table[major];
-            auto out_ptr = buf.mutable_data(major, 0);
-            for (size_t minor = 0; minor < num_minor; minor++) {
-                *out_ptr = row[minor];
-                out_ptr += stride;
+            const uint8_t *row_in = table[major].u8;
+            uint8_t *out_ptr = reinterpret_cast<uint8_t *>(buf.mutable_data(major, 0));
+            if (stride == 1) {
+                expand_bits_to_bools(row_in, num_minor, out_ptr);
+            } else {
+                expand_bits_to_bools_strided(row_in, num_minor, out_ptr, stride);
             }
         }
     }
@@ -352,9 +453,7 @@ simd_bit_table<MAX_BITWORD_WIDTH> stim_pybind::numpy_array_to_transposed_simd_ta
 
 pybind11::object bits_to_numpy_bool8(simd_bits_range_ref<MAX_BITWORD_WIDTH> bits, size_t num_bits) {
     bool *buffer = new bool[num_bits];
-    for (size_t minor = 0; minor < num_bits; minor++) {
-        buffer[minor] = bits[minor];
-    }
+    expand_bits_to_bools(bits.u8, num_bits, reinterpret_cast<uint8_t *>(buffer));
 
     pybind11::capsule free_when_done(buffer, [](void *f) {
         delete[] reinterpret_cast<bool *>(f);

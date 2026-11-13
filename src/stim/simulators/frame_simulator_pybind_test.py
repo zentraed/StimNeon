@@ -643,3 +643,30 @@ def test_broadcast_pauli_errors_one_probability(batch_size: int):
     sim = stim.FlipSimulator(batch_size=batch_size, disable_stabilizer_randomization=True)
     sim.broadcast_pauli_errors(pauli='X', p=1, mask=np.ones(shape=(10, batch_size), dtype=np.bool_))
     assert sum(e.weight for e in sim.peek_pauli_flips()) == batch_size * 10
+
+
+_BOOL_OUTPUT_SIZES = [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257, 300]
+
+
+@pytest.mark.parametrize("num_qubits", _BOOL_OUTPUT_SIZES)
+def test_to_numpy_bool_matches_bit_packed(num_qubits: int):
+    for batch_size in [1, 7, 64, 129, 257]:
+        sim = stim.FlipSimulator(batch_size=batch_size, num_qubits=num_qubits, seed=batch_size)
+        if num_qubits:
+            sim.do(stim.Circuit(f"X_ERROR(0.5) {' '.join(str(q) for q in range(num_qubits))}\n"
+                                f"Z_ERROR(0.5) {' '.join(str(q) for q in range(num_qubits))}\n"
+                                f"M {' '.join(str(q) for q in range(num_qubits))}\n"
+                                f"DETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]"))
+        for transpose in [False, True]:
+            kw = dict(transpose=transpose, output_xs=True, output_zs=True, output_measure_flips=True,
+                      output_detector_flips=True, output_observable_flips=True)
+            unpacked = sim.to_numpy(**kw)
+            packed = sim.to_numpy(bit_packed=True, **kw)
+            for u, p in zip(unpacked, packed):
+                assert u.dtype == np.bool_
+                assert u.view(np.uint8).max(initial=0) <= 1
+                np.testing.assert_array_equal(u, np.unpackbits(p, axis=1, bitorder='little')[:, :u.shape[1]])
+        if num_qubits:
+            m = sim.get_measurement_flips(record_index=num_qubits - 1)
+            pm = sim.get_measurement_flips(record_index=num_qubits - 1, bit_packed=True)
+            np.testing.assert_array_equal(m, np.unpackbits(pm, bitorder='little')[:batch_size])
